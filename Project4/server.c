@@ -1,3 +1,15 @@
+/**
+ * server.c
+ *
+ * by: Daniel Song, Isaac Stein
+ *
+ * last modified: 2018 Apr. 29
+ *
+ * This file details client functionality of our program.
+ * This file also contains many of the functions used for send, receive and
+    modify poll information or structure from or to clients.
+ */
+
 /********************************************************************
  * Includes
  *******************************************************************/
@@ -12,9 +24,12 @@
 #include <semaphore.h>
 #include <unistd.h>
 #include <limits.h>
-#include "util.h"
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include "server_util.h"
 
-
+#define NUM_ARGS 2
+#define MAX_CONNECTION 1000
 #define PDAG (*dag)
 
 /********************************************************************
@@ -47,14 +62,19 @@ struct candidates{
 typedef struct dag{
     struct dag *parent;
     char *name;
-    char *dir;
     int num_child;
     int index;
-    poll_state state;
+    enum poll_state state;
     struct dag **child;
     struct candidates *candidates;
     pthread_mutex_t mutex;
 }dag_t, *dag_pt;
+
+typedef struct threadArg{
+	char *client_ip;
+	int client_port;
+	int client_fd;
+}threadArg_t, *threadArg_pt;
 
 /********************************************************************
  * Globals
@@ -111,7 +131,7 @@ char *GetCandidatesString(struct candidates *d) {
   }
   for (int i=0 ; i<d->num_candidates ; i++) {
     name_string = Concat(d->names[i],":");
-    vote_string = Concat(itoa(d->votes[i]),"\n");
+    vote_string = Concat(itoa(d->votes[i]), "\n");
     full_string = Concat(name_string, vote_string);
     new_output = Concat(output, full_string);
     if (output!=NULL) free(output);
@@ -175,7 +195,6 @@ void AddVotes(struct candidates *d, char *name, int num_votes) {
       return;
     }
   }
-
   if (i == d->max_candidates) LengthenCandidates(d);
 
   d->names[i] = malloc(sizeof(char) * strlen(name));
@@ -214,7 +233,6 @@ void SubtractAllVotes(struct candidates *dest, struct candidates *src) {
 dag_pt new_dag() {
     dag_pt tmp = (dag_pt)malloc(sizeof(dag_t));
     tmp->parent = NULL;
-    tmp->dir = NULL;
     tmp->name = NULL;
     tmp->num_child = -1;
     tmp->index = -1;
@@ -226,7 +244,6 @@ dag_pt new_dag() {
     pthread_mutex_init(&tmp->mutex, &mutex_attr);
     return tmp;
 }
-
 
 /**
  * @brief Gets the specific DAG with name.
@@ -274,11 +291,16 @@ void build_dag(dag_pt *dag, char **output, int token, const char *output_path) {
         for(int i =0 ; i< token ;i ++) {
             char *node = output[i];
             if(i == 0) { /////////parent
-                if((find = get_dag(PDAG, node)) == NULL) { /////parent with no dag
+                if(input_dag->name == NULL) { /////parent with no dag
                     input_dag->name = malloc(sizeof(char) * strlen(node));
                     strcpy(input_dag->name,node);
                 } else { /////parent with initialized dag
+		  if((find = get_dag(PDAG, node)) != NULL) {
                     input_dag = find;
+		  } else {
+		   fprintf(stderr, "Malformed DAG parent region  not defined\n");
+	 	   exit(1);
+		  }
                 }
                 input_dag->num_child = token - 1;
                 find = NULL;
@@ -311,7 +333,7 @@ void print_dag(dag_pt dag){
         else{
             printf("Parent:%s ", dag->parent->name);
         }
-        printf("Name:%s ",dag->name);
+        printf("Name:%s (%d) ",dag->name, dag->num_child);
         for(int i =0; i < dag->num_child; i++){
             printf("Child %d:%s ",i, dag->child[i]->name);
         }
@@ -340,120 +362,32 @@ void free_dag(dag_pt dag){
     free(tmp);
 }
 
-/********************************************************************
- * Directory Functions
- *******************************************************************/
-
 /**
- * @brief Reads in the votes from some leaf file into a candidates structure.
+ * @brief Adds a new child onto an existing DAG.
  *
- * @param The candidate structure to read into.
- * @param The directory the file is contained in, including its name.
+ * @param The DAG to add the child to.
+ * @param The child name.
  */
-void ReadLeafFile(struct candidates *d, char *dir) {
-  if (d==NULL) return;
-  FILE *file;
-  if ((file = fopen(dir,"r")) == NULL) {
-    fprintf(stderr, "Unable to read file at path %s\n",dir);
-    return;
-  }
+void AddChildDag(struct dag *dag, char *name) {
+  struct dag *child_dag = new_dag();
+  child_dag->name = Concat(name, "");
+  child_dag->parent = dag;
 
-  char *name = (char *)malloc(sizeof(char) * MAX_SIZE);
-  while (fgets(name, MAX_SIZE, file)) {
-    if(name != NULL && strcmp(name,"\n")){///ignore empty case
-      DecodeInPlace(strtok(name,"\n"));
-      AddVote(d, name);
-    }
+  dag->num_child++;
+  if (dag->num_child == 0) dag->num_child++;
+  struct dag **children = (struct dag **)malloc(sizeof(struct dag *) * (dag->num_child));
+  for (int i=0 ; i<dag->num_child-1 ; i++) {
+    children[i] = dag->child[i];
   }
-  fclose(file);
+  children[dag->num_child-1] = child_dag;
+  free(dag->child);
+  dag->child = children;
+  printf("%s to %s\n",dag->name, dag->child[0]->name);
 }
-
 
 /********************************************************************
  * String Functions
  *******************************************************************/
-/**
- * @brief Makes a new executable path to a file in the dir path.
- *
- * @param The path with old executable.
- * @param The new executable.
- *
- * @return The new path.
- */
-char *replace_dir(char *path, char *name) {
-    int path_length = strlen(path);
-    int name_length = strlen(name);
-    char *arr_out = (char *)malloc((path_length+name_length) * sizeof(char));
-    int last_position;
-    for (last_position = path_length-2 ; path[last_position] != '/' && last_position>=0 ; last_position--);
-    last_position++;
-    strcpy(arr_out, path);
-    strcpy(arr_out+last_position, name);
-    return arr_out;
-}
-
-/**
- * @brief Takes in a full directory path and cuts it down to the last directory in its path.
- *
- * @param A full directory string.
- */
-void last_dir(char *dir) {
-    // If the directory is empty or of a length of 1 then we cannot trim off anything.
-    if (strlen(dir) < 2) return;
-    int dirlength = strlen(dir);
-    // We go backwards through th string, looking for the last position of '/'
-    // Dir is guaranteed to not have a trailing '/', so the length after the character will be non-trivial
-    int last_position, replace_position;
-    for (last_position = dirlength-1 ; dir[last_position] != '/' && last_position>=0 ; last_position--);
-    // If the last position is -1, then there are no '/'s in the dir.
-    if (last_position == -1) return;
-    last_position++;
-    for (replace_position = 0 ; (last_position+replace_position) < dirlength ; replace_position++) dir[replace_position] = dir[last_position+replace_position];
-    dir[replace_position] = '\0';
-}
-
-/**
- * @brief Returns the last dir in a path.
- *
- * @param A full directory string.
- *
- * @return The name of the last dir in the string.
- */
-char *get_last_dir(char *dir) {
-    // If the directory is empty or of a length of 1 then we cannot trim off anything.
-    if (strlen(dir) < 2) return NULL;
-    int dirlength = 0;
-    // We go backwards through th string, looking for the last position of '/'
-    // Dir is guaranteed to not have a trailing '/', so the length after the character will be non-trivial
-    int last_position;
-    for (last_position = strlen(dir)-1 ; dir[last_position] != '/' && last_position>=0 ; last_position--, dirlength++);
-
-    char *new_dir = (char *)malloc(sizeof(char) * (dirlength+2));
-    new_dir[dirlength--] = '\0';
-    for (last_position = strlen(dir)-1 ; dir[last_position] != '/' && last_position>=0 ; last_position--, dirlength--)
-      new_dir[dirlength] = dir[last_position];
-
-    return new_dir;
-}
-
-/**
- * @brief Gets the dir path for some output file from an input dir.
- *
- * @param The dir to get the output from.
- *
- * @return The output name.
- */
-char *get_output_name(char *dir) {
-  char *file_name, *full_file, *t_output, *output;
-  file_name = get_last_dir(dir);
-  full_file = Concat(file_name, ".txt");
-  free(file_name);
-  t_output = Concat(dir, "/");
-  output = Concat(t_output, full_file);
-  free(t_output);
-  free(full_file);
-  return output;
-}
 
 /**
  * @brief Adds a set of votes to every node in a DAG going up.
@@ -463,8 +397,10 @@ char *get_output_name(char *dir) {
  */
 void CascadeAdds(struct dag *dag, struct candidates *d) {
   if (dag == NULL || d == NULL) return;
+  pthread_mutex_lock(&dag->mutex);
   AddAllVotes(dag->candidates, d);
-  CascadeWrites(dag->parent, d);
+  pthread_mutex_unlock(&dag->mutex);
+  CascadeAdds(dag->parent, d);
 }
 
 /**
@@ -475,10 +411,54 @@ void CascadeAdds(struct dag *dag, struct candidates *d) {
  */
 void CascadeSubtracts(struct dag *dag, struct candidates *d) {
   if (dag == NULL || d == NULL) return;
+  pthread_mutex_lock(&dag->mutex);
   SubtractAllVotes(dag->candidates, d);
-  CascadeWrites(dag->parent, d);
+  pthread_mutex_unlock(&dag->mutex);
+  CascadeSubtracts(dag->parent, d);
 }
 
+/**
+ * @brief Gets the name of the winner in the dag.
+ *
+ * @return The name of the candidate with the most votes.
+ */
+char *GetWinnerString() {
+  if (dag->candidates->num_candidates == 0) return Concat("No Votes.", "");
+  int top_vote = -1;
+  int top_spot = -1;
+  for (int i=0; i<dag->candidates->num_candidates; i++) {
+    if (dag->candidates->votes[i] > top_vote) {
+      top_vote = dag->candidates->votes[i];
+      top_spot = i;
+    }
+  }
+  return Concat("Winner:", dag->candidates->names[top_spot]);
+}
+
+/**
+ * @brief Processes an return_winner command.
+ *
+ * @brief The request detailing the command.
+ * @brief The response of the successfullness.
+ */
+void Return_Winner(struct request *request, struct response *response) {
+  if (dag->state != CLOSED) {
+    response->code = Concat("RO", "");
+    response->data = Concat(dag->name, "");
+  } else {
+    response->code = Concat("SC", "");
+    pthread_mutex_lock(&dag->mutex);
+    response->data = GetWinnerString();
+    pthread_mutex_unlock(&dag->mutex);
+ }
+}
+
+/**
+ * @brief Converts a candidate structure into a character array representation.
+ *
+ * @brief The structure representing the votes.
+ * @return The character array representation.
+ */
 char *CandidatesString(struct candidates *cand) {
   if (cand->num_candidates == 0) return Concat("No votes.", "");
   char *data = NULL;
@@ -490,8 +470,8 @@ char *CandidatesString(struct candidates *cand) {
     old_data = data;
     name = Concat(cand->names[i], ":");
     votes = (i == cand->num_candidates-1) ?
-      Concat((cand->votes[i]), "") :
-      Concat((cand->votes[i]), ",");
+      Concat((itoa(cand->votes[i])), "") :
+      Concat((itoa(cand->votes[i])), ",");
     temp = Concat(name, votes);
     data = Concat(data, temp);
     if (old_data != NULL) free(old_data);
@@ -502,6 +482,12 @@ char *CandidatesString(struct candidates *cand) {
   return data;
 }
 
+/**
+ * @brief Processes an count_votes command.
+ *
+ * @brief The request detailing the command.
+ * @brief The response of the successfullness.
+ */
 void Count_Votes(struct request *request, struct response *response) {
   struct dag *mydag = get_dag(dag, request->region);
   if (mydag == NULL) {
@@ -509,93 +495,243 @@ void Count_Votes(struct request *request, struct response *response) {
     response->data = Concat(request->region, "");
     return;
   }
-  request->code = Concat("SC", "");
-  request->data = CandidatesString(mydag->candidates);
+  response->code = Concat("SC", "");
+  pthread_mutex_lock(&dag->mutex);
+  response->data = CandidatesString(mydag->candidates);
+  pthread_mutex_unlock(&dag->mutex);
 }
 
+/**
+ * @brief Opens the polls in the region if applicable.
+ *
+ * @brief The region to open the polls in.
+ */
 void Open_Polls_aux(struct dag *dag) {
-  dag->state = OPEN;
-  for (int i=0 ; i<(dag->num_child + 1) ; i++) {
+  if (dag == NULL) return;
+  pthread_mutex_lock(&dag->mutex);
+  if (dag->state == NEW) dag->state = OPEN;
+  pthread_mutex_unlock(&dag->mutex);
+  for (int i=0 ; i<(dag->num_child ) ; i++) {
     Open_Polls_aux(dag->child[i]);
   }
 }
 
+/**
+ * @brief Processes an open_polls command.
+ *
+ * @brief The request detailing the command.
+ * @brief The response of the successfullness.
+ */
 void Open_Polls(struct request *request, struct response *response) {
   struct dag *mydag = get_dag(dag, request->region);
   if (mydag == NULL) {
     response->code = Concat("NR", "");
     response->data = Concat(request->region, "");
-  }
-  if (mydag->state == OPEN) {
+  } else if (mydag->state == OPEN) {
     response->code = Concat("PF", "");
-    response->data = Concat(request->region, "");
-  } else if (my_dag->state == CLOSED) {
+    response->data = Concat(request->region, " open");
+  } else if (mydag->state == CLOSED) {
     response->code = Concat("RR", "");
     response->data = Concat(request->region, "");
   } else {
     Open_Polls_aux(mydag);
     response->code = Concat("SC", "");
+    response->data = Concat("", "");
   }
 }
 
+/**
+ * @brief Closes the polls in the region if applicable.
+ *
+ * @brief The region to close the polls in.
+ */
 void Close_Polls_aux(struct dag *dag) {
-  dag->state = CLOSED;
-  for (int i=0 ; i<(dag->num_child + 1) ; i++) {
+  if (dag == NULL) return;
+  pthread_mutex_lock(&dag->mutex);
+  if (dag->state == OPEN) dag->state = CLOSED;
+  pthread_mutex_unlock(&dag->mutex);
+  for (int i=0 ; i<(dag->num_child) ; i++) {
     Close_Polls_aux(dag->child[i]);
   }
 }
 
+/**
+ * @brief Processes an close_polls command.
+ *
+ * @brief The request detailing the command.
+ * @brief The response of the successfullness.
+ */
 void Close_Polls(struct request *request, struct response *response) {
   struct dag *mydag = get_dag(dag, request->region);
   if (mydag == NULL) {
     response->code = Concat("NR", "");
     response->data = Concat(request->region, "");
-  }
-  if (mydag->state = CLOSED) {
+  } else if (mydag->state == CLOSED) {
     response->code = Concat("PF", "");
-    response->data = Concat(request->region, "");
+    response->data = Concat(request->region, " closed");
+  } else if (mydag->state == NEW) {
+    response->code = Concat("PF", "");
+    response->data = Concat(request->region, " unopened");
   } else {
     Close_Polls_aux(mydag);
     response->code = Concat("SC", "");
+    response->data = Concat("", "");
   }
 }
 
+/**
+ * @brief Converts a character string of votes to an appropriate candidate structure representation.
+ *
+ * @brief The votes to be added.
+ * @return The candidates array storing the votes.
+ */
 struct candidates *CreateCandidates(char *data) {
-  struct candidates *d = (struct candidates *)malloc(sizeof(struct candidates));
+  struct candidates *d = NewCandidates();
+  if (strlen(data) == 0) return d;
+  char *name;
+  char *tdata = Concat(data, "");
+  int num;
+  int start_index = 0;
+  int middle_index = 0;
+  int end_index = 0;
+  int ended = 0;
+  while (!ended) {
+    if (tdata[middle_index] == ':' && (tdata[end_index] == ',' || tdata[end_index] == '\0')) {
+      if (tdata[end_index] == '\0') ended = 1;
+      if (middle_index <= start_index) {
+	fprintf(stderr,"Error: strage vote data string %s\n", data);
+      }
+      tdata[middle_index++] = '\0';
+      tdata[end_index++] = '\0';
+      name = Concat(tdata + start_index, "");
+      num = atoi(tdata + middle_index);
+      AddVotes(d, name, num);
+      free(name);
+      start_index = end_index;
+    } else if (tdata[end_index] == ':') {
+      middle_index = end_index++;
+    } else {
+      end_index++;
+    }
+  }
   return d;
 }
 
+/**
+ * @brief Processes an add_votes command.
+ *
+ * @brief The request detailing the command.
+ * @brief The response of the successfullness.
+ */
 void Add_Votes(struct request *request, struct response *response) {
   struct dag *mydag = get_dag(dag, request->region);
   if (mydag == NULL) {
     response->code = Concat("NR", "");
     response->data = Concat(request->region, "");
-  }
-  if (mydag->state != OPEN) {
+  } else if (mydag->num_child >= 0) { // Dag does not actually store the number of children
+    response->code = Concat("NL", "");
+    response->data = Concat(request->region, "");
+  } else if (mydag->state != OPEN) {
     response->code = Concat("RC", "");
     response->data = Concat(request->region, "");
   } else {
     response->code = Concat("SC", "");
+    response->data = Concat("", "");
     struct candidates *vote_change = CreateCandidates(request->data);
     CascadeAdds(mydag, vote_change);
     free(vote_change);
   }
 }
 
+/**
+ * @brief Checks that a set of votes may be removed from a dag without error.
+ *        If they can, the votes are then subtracted
+ *
+ * @brief The response of the successfullness.
+ * @brief The base DAG to remove the votes from.
+ * @brief The set of votes to subtract.
+ */
+void TrySubtraction(struct response *response, struct dag *dag, struct candidates *vote_change) {
+  response->data = Concat("", "");
+  char *temp;
+  int valid;
+  int first_error = 1;
+  for (int c=0 ; c<vote_change->num_candidates ; c++) {
+    valid = 0;
+    for(int i=0 ; i<dag->candidates->num_candidates ; i++) {
+      if (!strcmp(vote_change->names[c], dag->candidates->names[i]) &&
+          dag->candidates->votes[i] >= vote_change->votes[c]) {
+        valid = 1;
+      }
+    }
+    if (!valid) {
+      if (!first_error) {
+        temp = response->data;
+        response->data = Concat(response->data, ",");
+        free(temp);
+      } else {
+        first_error = 0;
+      }
+      temp = response->data;
+      response->data = Concat(response->data, vote_change->names[c]);
+      free(temp);
+    }
+  }
+
+  if (first_error) {
+    response->code = Concat("SC", "");
+    CascadeSubtracts(dag, vote_change);
+  } else {
+    response->code = Concat("IS", "");
+  }
+}
+
+/**
+ * @brief Processes a remove_votes command.
+ *
+ * @brief The request detailing the command.
+ * @brief The response of the successfullness.
+ */
 void Remove_Votes(struct request *request, struct response *response) {
   struct dag *mydag = get_dag(dag, request->region);
   if (mydag == NULL) {
     response->code = Concat("NR", "");
     response->data = Concat(request->region, "");
-  }
-  if (mydag->state != OPEN) {
+  } else if (mydag->num_child >= 0) { // Dag does not actually store the number of children
+    response->code = Concat("NL", "");
+    response->data = Concat(request->region, "");
+  } else if (mydag->state != OPEN) {
     response->code = Concat("RC", "");
     response->data = Concat(request->region, "");
   } else {
-    response->code = Concat("SC", "");
     struct candidates *vote_change = CreateCandidates(request->data);
-    CascadeSubtracts(mydag, vote_change);
+    TrySubtraction(response, mydag, vote_change);
     free(vote_change);
+  }
+}
+
+/**
+ * @brief Adds a region to the dag.
+ *
+ * @brief The request detailing the command.
+ * @brief The response of the successfullness.
+ */
+void Add_Region(struct request *request, struct response *response) {
+  struct dag *mydag = get_dag(dag, request->region);
+  struct dag *testdag = get_dag(dag, request->data);
+  if (mydag == NULL) {
+    response->code = Concat("NR", "");
+    response->data = Concat(request->region, "");
+  } else if (testdag != NULL) {
+    response->code = Concat("UE", "");
+    response->data = Concat("", "");
+  } else {
+    //printf("Adding child region %s to region %s\n", request->data, request->region);
+    pthread_mutex_lock(&mydag->mutex);
+    AddChildDag(mydag, request->data);
+    pthread_mutex_unlock(&mydag->mutex);
+    response->code = Concat("SC", "");
+    response->data = Concat("Region added successfully", "");
   }
 }
 
@@ -610,6 +746,7 @@ struct response *ExecuteRequest(struct request *request) {
   response->data = NULL;
   response->code = NULL;
   if (!strcmp(request->code, "RW")) {
+    Return_Winner(request, response);
   } else if (!strcmp(request->code, "CV")) {
     Count_Votes(request, response);
   } else if (!strcmp(request->code, "OP")) {
@@ -620,6 +757,8 @@ struct response *ExecuteRequest(struct request *request) {
     Remove_Votes(request, response);
   } else if (!strcmp(request->code, "CP")) {
     Close_Polls(request, response);
+  } else if (!strcmp(request->code, "AR")) {
+    Add_Region(request, response);
   } else {
     response->code = Concat("UC", "");
     response->data = Concat(request->code, "");
@@ -628,57 +767,84 @@ struct response *ExecuteRequest(struct request *request) {
 }
 
 /**
+ * @brief Creates a request structure from an input character array.
+ *
+ * @param The input.
+ * @return The request.
+ */
+struct request *CreateRequest(char *message) {
+  struct request *request = (struct request *)malloc(sizeof(struct request));
+  request->code = (char *)malloc(3 *sizeof(char));
+  request->region = (char *)malloc(16 *sizeof(char));
+  request->data = (char *)malloc(239 *sizeof(char));
+	/////changed
+	memset (request->code,'\0',(3 *sizeof(char)));
+	memset (request->region,'\0',(16 *sizeof(char)));
+	memset (request->data,'\0',(239 *sizeof(char)));
+	/////changed
+  sscanf(message,"%[^;];%[^;];%[^;]", request->code, request->region, request->data);
+  int i;
+  for (i=strlen(request->region) ; request->region[i] == ' ' || request->region[i] == '\0' ; i--);
+  request->region[i+1] = '\0';
+  return request;
+}
+
+/**
+ * @brief Creates a character array from a response structure.
+ *
+ * @param The response.
+ * @return The resulting character array.
+ */
+char *EncodeResponse(struct response *response) {
+  char *message = (char *)malloc(2+strlen(response->code) + strlen(response->data));
+  strcpy(message, response->code);
+  strcpy(message+strlen(response->code), ";");
+  strcpy(message+(strlen(response->code)+1), response->data);
+  strcpy(message+(strlen(message)), "\0");
+  return message;
+}
+
+/**
+ * @brief deallocate request and response have been allocated
+ */
+void FreeRequestResponse(struct request *req, struct response *res){
+	free(req->code);
+	free(req->region);
+	free(req->data);
+	free(req);
+
+	free(res->code);
+	free(res->data);
+	req = NULL;
+	res = NULL;
+}
+
+/**
  * @brief This function details all of the actions that a child process is to undertake.
  */
-void *child_function() {
-  // The entire function loops until in find that queue is empty
-  char *file_dir = NULL;
-  char *file_name = NULL;
-  struct candidates *my_candidates = NULL;
-  while (1) {
-    // 1. Retrieve file name from queue
-    pthread_mutex_lock(&queue_lock);
-    file_name = dequeue(queue);
-    pthread_mutex_unlock(&queue_lock);
-    // dequeue returns NULL when the queue is empty
-    // This means that the queue is empty and the
-    //   execution is complete.
-    if (file_name == NULL) return NULL;
-    //printf("here with %s\n",file_name);
+void *threadFunction(void *arg){
 
-    struct dag *my_dag = NULL;
-    my_dag = get_dag(dag, file_name);
-
-    // If the name is not found in the DAG then ignore the error and continue on.
-    if (my_dag == NULL) {
-      fprintf(stderr,"Error: file name %s pulled from queue not found in DAG!\n", file_name);
-      continue;
-    }
-    if (my_dag->num_child != -1) { // I have no idea why num_child does not actually store the number of children.
-      fprintf(stderr,"Error: file %s is not actually a leaf node! Ignoring input.\n", file_name);
-      continue;
-    }
-
-
-    // Append status to log.txt
-    write_to_log(file_name, pthread_self(), "start\n");
-
-    // The leaf file is read and decrypted
-    my_candidates = NewCandidates();
-    char *temp = Concat(input_dir, "/");
-    file_dir = Concat(temp, file_name);
-    free(temp);
-    ReadLeafFile(my_candidates, file_dir);
-
-    // The output is written
-    char *out_name = get_output_name(my_dag->dir);
-    WriteLeafFile(my_candidates, out_name);
-    free(out_name);
-    CascadeWrites(my_dag->parent, my_candidates);
-
-    // Append status to log.txt
-    write_to_log(file_name, pthread_self(), "end\n");
-  }
+	threadArg_pt args = (threadArg_pt)arg;
+	int client_sockfd = args->client_fd;
+	char req_buff[STRING_SIZE] = {""};
+	int req_len = 0;
+	while((req_len = read(client_sockfd, req_buff, STRING_SIZE)) != 0){
+		struct request *req = CreateRequest(req_buff);
+		printf("Request received from client at %s:%d, %s %s %s​\n",
+					args->client_ip, args->client_port, req->code, req->region, req->data);
+		struct response *res = ExecuteRequest(req);
+		printf("Sending response to client at %s:%d, %s %s\n",
+					args->client_ip, args->client_port, res->code, res->data);
+		char *send_res = EncodeResponse(res);
+		write(client_sockfd, send_res, STRING_SIZE);
+		usleep(500);
+		FreeRequestResponse(req,res);
+	}
+	printf("Closed connection with client at %s:%d\n",
+				args->client_ip, args->client_port);
+	close(client_sockfd);
+	pthread_detach(pthread_self());
+	return NULL;
 }
 
 /********************************************************************
@@ -686,35 +852,14 @@ void *child_function() {
  *******************************************************************/
 
 int main(int argc, char **argv) {
-  if (argc > 5 || argc < 4) {
-    // A bit of an ugly error message, but it gets the job done
-    fprintf(stderr, "Error: Incorrct number of arguments: Expected 3-4, Got %d\n"
-          "proper arguments are: DAG, input_dir, output_dir, <num_threads>\n", argc-1);
-    exit(1);
-  }
-  const char *dag_file;
-  int num_threads;
-
-  dag_file = argv[1];
-  input_dir = argv[2];
-  output_dir = argv[3];
-  // Does not check that the input is less than INT_MAX, may overflow into smaller positives on large input
-  num_threads = (argc == 5 && atoi(argv[4]) > 0) ? atoi(argv[4]) : 4;
-
-  pthread_t *threads;
-  pthread_attr_t custom_attr;
-  threads = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
-  pthread_attr_init(&custom_attr);
-
-  // The DAG is read in.
-  int token_line, token;
-  char **output_line, **output, *content = NULL;
-  token_line = token = 0;
-  int check = is_dir(dag_file);
-  if(check){/////dag_file is dir
-    fprintf(stderr,"Directory, Input valid file name.\n");
-    exit(3);
-  }
+	if (argc < NUM_ARGS + 1) {
+			printf("Usage : ./server <DAG FILE> <Server Port>\n");
+			exit(1);
+	}
+	// The DAG is read in.
+	const char *dag_file = argv[1];
+	char **output_line, **output, *content = NULL;
+  int token_line =0, token =0;
 
   output_line = (char **)malloc(MAX_SIZE);
   output = (char **)malloc(MAX_SIZE);
@@ -730,74 +875,56 @@ int main(int argc, char **argv) {
   token_line = tokenizer(content, "\n", output_line); /////tokenize by line
   for(int i =0 ; i < token_line; i++){
     token = tokenizer(output_line[i], ":", output); /////tokenize by line
-    build_dag(&dag, output, token, output_dir);
+    build_dag(&dag, output, token, NULL);
   }
   ////////////////////////free output
-  for(int i =0 ; i < token; i++){
-    //printf("%d : %s\n",&output[i],output[i]);
-    free(output[i]);
-  }
-  free(output);
-  output = NULL;
-
-  for(int i =0 ; i < token_line; i++){
-    //printf("%s\n",output_line[i]);
-    free(output_line[i]);
-  }
-  free(output_line);
-  output_line = NULL;
-
-  free(content);
+	free_output(output, token);
+	free_output(output_line, token_line);
+	free(content);
   content = NULL;
 
-  // The ouptut directory is created
-  int acc = access(output_dir, F_OK);
-    if(acc == 0){///folder exist
-        char *path_rm = malloc(sizeof(char)*MAX_SIZE);
-        strcpy(path_rm, output_dir);
-        rmdir_recurive(path_rm);
-  }
-  mkdir(output_dir,0777);
-  create_output_dir(dag, output_dir);
+	//////////////////////Initiate TCP Connection
+	int server_port = atoi(argv[2]); ////need error handling
 
-  // The log directory is created
-  log_dir = Concat(output_dir, "/log.txt");
+	int server_sockfd = socket(AF_INET , SOCK_STREAM , 0);
+	struct sockaddr_in server_addr;
+	server_addr.sin_family = AF_INET;
+	server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	server_addr.sin_port = htons(server_port);
+	int server_len = sizeof(server_addr);
 
-  // The queue is created
-  queue = NewQueue();
+	if(bind(server_sockfd, (struct sockaddr *) &server_addr, server_len) < 0){
+		perror("Cannot Bind\n");
+		exit(1);
+	}
 
-  // The contents of the queue are read in from the input directory
-  build_queue(input_dir, queue, dag);
+	if(listen(server_sockfd, MAX_CONNECTION) < 0){
+		perror("Cannot Listen\n");
+		exit(1);
+	}
+	printf("Server listening on port %d\n",server_port);
 
-  // If the queue is empty, we are done
-  if (queue->head == NULL) {
-    fprintf(stderr,"error: input directory is empty\n");
-    return 0;
-  }
+	while (1){
+		struct sockaddr_in client_addr;
 
-  // Thread specific activites are executed
-  for (int i=0 ; i<num_threads ; i++) {
-    pthread_create(&threads[i],
-		   &custom_attr,
-		   (void *)child_function,
-		   (void *)NULL);
-  }
-  for (int i=0 ; i<num_threads ; i++) pthread_join(threads[i], NULL);
-
-  // The winner is decided
-  char *winner_file = get_output_name(dag->dir);
-  FILE *outfile;
-  if ((outfile = fopen(winner_file, "a+")) == NULL) {
-    fprintf(stderr,"Failed to write winnde output to file %s\n", winner_file);
-  } else {
-    GetWinner(outfile);
-    fclose(outfile);
-  }
-
-  free(winner_file);
-  free(threads);
+		socklen_t size = sizeof(struct sockaddr_in);
+		int client_sockfd = accept(server_sockfd, (struct sockaddr*) &client_addr, &size);
+		if(client_sockfd != -1){
+			pthread_t thread;
+			int cli_port = ntohs(client_addr.sin_port);
+			char *addr_str = inet_ntoa(client_addr.sin_addr);
+			printf("Connection initiated from client at %s:%d\n",addr_str,cli_port);
+			threadArg_pt arg = (threadArg_pt)malloc(sizeof(threadArg_t));
+			arg->client_ip = addr_str;
+			arg->client_fd = client_sockfd;
+			arg->client_port = cli_port;
+			if(pthread_create(&thread, NULL, (void*)threadFunction, (void*)arg) < 0){
+				fprintf(stderr,"Thread Create Error\n");
+			}
+		}
+	}
+	close(server_sockfd);
   free_dag(dag);
   dag = NULL;
   return 0;
 }
-
