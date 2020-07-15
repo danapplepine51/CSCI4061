@@ -1,0 +1,30 @@
+Daniel Song - song0254
+Isaac Stein - stei1244
+
+Lecture Section 012
+
+We implemented the extra credit.
+
+The purpose of the program is to create a file structure defined in an input text file and to write this to an output directory. Every text file is then read in an input directory and those which match the name of a directory in the output have their contents decoded and rewritten. The count of these "votes" is then aggregated up through the output directory until it reaches the top. The top directory finds the winner and writes that they are the winner. This all is to be done in parallel among four or a user-defined number of processes, each process writing to a log file when they start reading in leaf data and when they finish.
+
+Compile the program by running the make file in the directory the source is in.
+
+The program should be run with the arguments :
+  DAG, input_dir, output_dir, <num_threads>
+The DAG is a file that denotes the output directory structure.
+The input_dir is the directory that the input files are to be read from.
+The output_dir is the output directory that the files are to be written to.
+The num_threads is an optional argument which specifies the number of threads.
+
+The program creates the file structure and simulates it in a structure we call the DAG.
+The program then reads in the input directory names into a queue, setting their priority as instructed.
+We then have each thread call a function which loop infinately as they pull names from the queue, check if they exist in the DAG,
+then write out their output in the files as instructed.
+Once the queue is empty, all of the files from the input directory have been read, so the threads are all merged back into one.
+The winner is then declared before closing, as instructed.
+
+DS - Wrote code for reading in DAG, structuring DAG and output, Makefile. Also performed various tests and code fixes.
+
+IS - Wrote code for reading in input, implementing parallelism, writing and calculating output, and structuring the priority queue and the candidate lists. Also cleaned up code style somewhat.
+
+Both created program structure and documentation.

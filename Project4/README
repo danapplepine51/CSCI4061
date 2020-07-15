@@ -1,0 +1,8 @@
+Daniel Song, Isaac Stein
+song0254, stei1244
+Lecture Section 012
+did extra credit
+
+Daniel - Implemented all client implemetation, communication, printouts, test cases, fine tuning.
+
+Isaac - Implemented message decoding, encoding, commands handling, parallelism.
